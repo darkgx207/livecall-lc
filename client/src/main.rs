@@ -2,7 +2,7 @@ mod media;
 
 use futures_util::{SinkExt, StreamExt};
 use iced::{
-    widget::{button, column, container, row, scrollable, slider, pick_list, text, text_input, Space},
+    widget::{button, column, container, row, scrollable, slider, pick_list, text, text_input, image, Space},
     Alignment, Element, Length, Subscription, Task, Theme,
 };
 use serde::{Deserialize, Serialize};
@@ -124,6 +124,7 @@ struct App {
     participants: Vec<Participant>,
     peer_volumes: HashMap<String, u8>,
     requested_video: HashSet<String>,
+    video_images: HashMap<String, (u64, image::Handle)>,
     open_volume_panel: Option<String>,
     network: Option<Network>,
     media_engine: Option<Arc<media::MediaEngine>>,
@@ -158,6 +159,7 @@ impl Default for App {
             participants: Vec::new(),
             peer_volumes: HashMap::new(),
             requested_video: HashSet::new(),
+            video_images: HashMap::new(),
             open_volume_panel: None,
             network: None,
             media_engine: None,
@@ -232,6 +234,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.participants.clear();
             app.peer_volumes.clear();
             app.requested_video.clear();
+                app.video_images.clear();
             app.open_volume_panel = None;
             app.microphone_before_deafen = None;
             app.deafened = false;
@@ -332,10 +335,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if let Some(engine) = &app.media_engine {
                 match engine.request_remote_camera(&peer_id, !currently) {
                     Ok(()) => {
-                        if currently { app.requested_video.remove(&peer_id); }
+                        if currently { app.requested_video.remove(&peer_id); app.video_images.remove(&peer_id); engine.clear_video_frame(&peer_id); }
                         else { app.requested_video.insert(peer_id); }
-                        app.status = if currently { "Recepção VP8 suspensa para este participante.".into() }
-                            else { "Solicitando VP8; pacotes serão contados (imagem na Fase 5B).".into() };
+                        app.status = if currently { "Vídeo interrompido para este participante.".into() }
+                            else { "Solicitando transmissão VP8; aguardando imagem...".into() };
                     }
                     Err(error) => app.status = format!("Falha ao solicitar VP8: {error}"),
                 }
@@ -454,6 +457,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.participants.clear();
                 app.peer_volumes.clear();
             app.requested_video.clear();
+                app.video_images.clear();
                 app.open_volume_panel = None;
                 app.screen_sharing = false;
                 app.camera_enabled = false;
@@ -467,6 +471,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.participants.clear();
             app.peer_volumes.clear();
             app.requested_video.clear();
+                app.video_images.clear();
             app.open_volume_panel = None;
             app.screen_sharing = false;
             app.camera_enabled = false;
@@ -485,6 +490,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.participants = participants.clone();
                 app.peer_volumes.clear();
             app.requested_video.clear();
+                app.video_images.clear();
                 app.open_volume_panel = None;
                 app.screen = Screen::Call;
                 app.status = "Sala conectada; preparando áudio Opus P2P...".into();
@@ -521,6 +527,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.participants.retain(|p| p.user_id != user_id);
                 app.peer_volumes.remove(&user_id);
                 app.requested_video.remove(&user_id);
+                app.video_images.remove(&user_id);
                 if app.open_volume_panel.as_deref() == Some(user_id.as_str()) { app.open_volume_panel = None; }
                 if let Some(engine) = app.media_engine.clone() {
                     return Task::perform(async move { engine.close_peer(&user_id).await; Ok(()) }, Message::PeerOperationResult);
@@ -534,6 +541,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     p.screen_sharing = screen_sharing;
                 }
                 if !camera_enabled && app.requested_video.remove(&user_id) {
+                    app.video_images.remove(&user_id);
+                    if let Some(engine) = &app.media_engine { engine.clear_video_frame(&user_id); }
                     if let Some(engine) = &app.media_engine {
                         let _ = engine.request_remote_camera(&user_id, false);
                     }
@@ -551,6 +560,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.deafened = false;
                 app.peer_volumes.clear();
             app.requested_video.clear();
+                app.video_images.clear();
                 app.open_volume_panel = None;
                 app.network = None;
                 app.screen = Screen::Login;
@@ -567,6 +577,19 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
         }
         Message::PollNetwork => {
+            if app.screen == Screen::Call {
+                if let Some(engine) = &app.media_engine {
+                    let frames = engine.video_frames();
+                    for peer in &app.requested_video {
+                        if let Some(frame) = frames.latest(peer) {
+                            if app.video_images.get(peer).map_or(true, |(number, _)| *number != frame.frame_number) {
+                                app.video_images.insert(peer.clone(), (frame.frame_number,
+                                    image::Handle::from_rgba(media::video_width(), media::video_height(), (*frame.rgba).clone())));
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(network) = &app.network {
                 if let Ok(mut queue) = network.inbound.lock() {
                     if let Some(event) = queue.pop_front() { return Task::done(Message::ServerEvent(event)); }
@@ -778,7 +801,7 @@ fn call_view(app: &App) -> Element<'_, Message> {
             participant_row.push(text("Voce").size(11))
         } else {
             let subscribed = app.requested_video.contains(&participant.user_id);
-            let video_button = button(if subscribed { "Parar VP8" } else { "Receber VP8" })
+            let video_button = button(if subscribed { "Parar de assistir" } else { "Assistir" })
                 .padding([5, 7]);
             let video_button = if participant.camera_enabled || subscribed {
                 video_button.on_press(Message::ToggleVideoSubscription(participant.user_id.clone()))
@@ -847,15 +870,38 @@ fn call_view(app: &App) -> Element<'_, Message> {
         .padding(12).width(Length::Fixed(290.0)).height(Length::Fill)
         .style(dark_call_background);
 
-    let stream_area = container(column![
-        text("Area de transmissoes").size(23),
-        text("O video recebido ainda nao e renderizado nesta fase.").size(14)
-            .color(iced::Color::from_rgb(0.64, 0.69, 0.76)),
-        text("Para testar a recepcao opcional, use Receber VP8 no cartao do participante.")
-            .size(12).color(iced::Color::from_rgb(0.64, 0.69, 0.76)),
-    ].spacing(12).align_x(Alignment::Center))
-        .center_x(Length::Fill).center_y(Length::Fill)
-        .width(Length::Fill).height(Length::Fill).style(dark_call_background);
+    let active_videos = app.participants.iter()
+        .filter(|p| app.requested_video.contains(&p.user_id))
+        .fold(column![].spacing(12), |items, participant| {
+            let picture: Element<'_, Message> = if let Some((_, handle)) = app.video_images.get(&participant.user_id) {
+                image(handle.clone()).width(Length::Fill).height(Length::Fixed(280.0)).into()
+            } else {
+                container(text("Aguardando quadros VP8 da câmera...").size(14))
+                    .center_x(Length::Fill).center_y(Length::Fixed(180.0))
+                    .style(dark_call_background).into()
+            };
+            items.push(container(column![
+                row![
+                    text(format!("Câmera de {}", participant.username)).size(16).width(Length::Fill),
+                    button("Fechar").on_press(Message::ToggleVideoSubscription(participant.user_id.clone())),
+                ].align_y(Alignment::Center),
+                picture,
+            ].spacing(8)).padding(12).width(Length::Fill).style(dark_card))
+        });
+
+    let stream_area: Element<'_, Message> = if app.requested_video.is_empty() {
+        container(column![
+            text("Área de transmissões").size(23),
+            text("Nenhuma transmissão aberta.").size(14),
+            text("Clique em Assistir ao lado de um participante que esteja transmitindo câmera.")
+                .size(12),
+        ].spacing(12).align_x(Alignment::Center))
+            .center_x(Length::Fill).center_y(Length::Fill)
+            .width(Length::Fill).height(Length::Fill).style(dark_call_background).into()
+    } else {
+        container(scrollable(active_videos).height(Length::Fill))
+            .width(Length::Fill).height(Length::Fill).style(dark_call_background).into()
+    };
 
     let media_status = if app.media_engine.as_ref().is_some_and(|e| e.audio_error().is_none()) {
         "Audio: Opus 48 kHz P2P preparado (aguardando fluxo remoto)"

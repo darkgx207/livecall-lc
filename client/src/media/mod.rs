@@ -1,6 +1,10 @@
 //! WebRTC P2P signaling and Opus audio for LiveCall (subphase 4B).
 mod audio;
 mod video;
+mod remote_video;
+pub use remote_video::VideoFrames;
+pub fn video_width() -> u32 { remote_video::WIDTH }
+pub fn video_height() -> u32 { remote_video::HEIGHT }
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use bytes::Bytes;
 use audio::AudioRuntime;
@@ -63,6 +67,7 @@ pub struct MediaEngine {
     camera: Arc<CameraRuntime>,
     video_subscribers: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     video_workers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    video_frames: VideoFrames,
 }
 
 impl std::fmt::Debug for MediaEngine {
@@ -98,9 +103,11 @@ impl MediaEngine {
                 (None, None, Some(error))
             }
         };
-        Ok(Self { api: Arc::new(api), peers: Arc::new(Mutex::new(HashMap::new())), pending_ice: Arc::new(Mutex::new(HashMap::new())), outbound, max_peers: config.max_peers, ice_servers: config.ice_servers, audio, audio_track, audio_error, camera: Arc::new(CameraRuntime::new()), video_subscribers: Arc::new(Mutex::new(HashMap::new())), video_workers: Arc::new(Mutex::new(HashMap::new())) })
+        Ok(Self { api: Arc::new(api), peers: Arc::new(Mutex::new(HashMap::new())), pending_ice: Arc::new(Mutex::new(HashMap::new())), outbound, max_peers: config.max_peers, ice_servers: config.ice_servers, audio, audio_track, audio_error, camera: Arc::new(CameraRuntime::new()), video_subscribers: Arc::new(Mutex::new(HashMap::new())), video_workers: Arc::new(Mutex::new(HashMap::new())), video_frames: VideoFrames::default() })
     }
 
+    pub fn video_frames(&self) -> VideoFrames { self.video_frames.clone() }
+    pub fn clear_video_frame(&self, peer: &str) { self.video_frames.clear(peer); }
     pub fn audio_error(&self) -> Option<&str> { self.audio_error.as_deref() }
     pub async fn select_microphone(&self, label: String) -> Result<(), String> {
         let audio = self.audio.clone().ok_or("Áudio indisponível")?;
@@ -155,27 +162,21 @@ impl MediaEngine {
             let target = state_target.clone();
             Box::pin(async move { eprintln!("[WebRTC] peer {target}: {state:?}"); })
         }));
-        if let Some(audio) = &self.audio {
-            let playback = audio.playback.clone();
+        {
+            let playback = self.audio.as_ref().map(|a| a.playback.clone());
+            let video_frames = self.video_frames.clone();
             let remote_id = peer_id.to_string();
             pc.on_track(Box::new(move |track, _receiver, _transceiver| {
                 let playback = playback.clone();
+                let video_frames = video_frames.clone();
                 let remote_id = remote_id.clone();
                 Box::pin(async move {
-                    // Only Opus goes to the audio decoder. VP8 decoding/rendering is 5B.
+                    // Keep audio and video decoding independent.
                     let codec = track.codec().capability.mime_type;
                     if codec.eq_ignore_ascii_case("audio/opus") {
-                        tokio::spawn(audio::decode_remote(remote_id, track, playback));
+                        if let Some(playback) = playback { tokio::spawn(audio::decode_remote(remote_id, track, playback)); }
                     } else if codec.eq_ignore_ascii_case("video/vp8") {
-                        tokio::spawn(async move {
-                            let mut received = 0_u64;
-                            while track.read_rtp().await.is_ok() {
-                                received += 1;
-                                if received % 100 == 0 {
-                                    eprintln!("[Vídeo] {remote_id}: {received} pacotes VP8 recebidos (sem exibição na 5A)");
-                                }
-                            }
-                        });
+                        tokio::spawn(remote_video::decode_remote(remote_id, track, video_frames));
                     }
                 })
             }));
@@ -283,6 +284,7 @@ impl MediaEngine {
 
     pub async fn close_peer(&self, peer_id: &str) {
         self.pending_ice.lock().await.remove(peer_id);
+        self.video_frames.clear(peer_id);
         if let Some(subscription) = self.video_subscribers.lock().await.remove(peer_id) {
             subscription.store(false, Ordering::Release);
         }
@@ -292,6 +294,7 @@ impl MediaEngine {
     }
     pub async fn close_all(&self) {
         self.pending_ice.lock().await.clear();
+        self.video_frames.clear_all();
         self.camera.stop().await;
         for (_, subscription) in self.video_subscribers.lock().await.drain() {
             subscription.store(false, Ordering::Release);

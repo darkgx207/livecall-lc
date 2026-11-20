@@ -38,3 +38,8 @@ Captura via FFmpeg, track WebRTC VP8 por peer e assinatura opcional de RTP (aind
 ### Câmeras no Linux — Fase 5A.1
 
 O LiveCall agora lista dispositivos V4L2 de captura no cabeçalho da chamada, permite selecionar webcam (inclusive virtual/OBS), atualizar a lista e informa quando nenhuma câmera está disponível. Veja `docs/FASE5A1.md` para testes e limitações. O vídeo ainda não é renderizado nesta fase.
+
+
+## Fase 5B (experimental)
+
+Recepção e exibição opcional de vídeo VP8 na área central. Veja `docs/FASE5B.md` para pré-requisitos e limitações.
