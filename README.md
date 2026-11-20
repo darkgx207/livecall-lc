@@ -24,3 +24,8 @@ Consulte `docs/FASE4C.md` para o controle local de áudio recebido (ensurdecer) 
 ## Fase 4E — Volume individual de participantes
 
 Na tela de chamada, use o botão **Volume** ao lado de cada participante remoto para alternar 100% → 50% → 0% → 100%. Isso modifica somente a reprodução local. Consulte `docs/FASE4E.md`.
+
+
+## Fase 4F
+
+Inclui alteração do servidor no lobby, volume individual contínuo com slider, paleta escura e botão Assistir preparado (inativo até haver vídeo real). Consulte `docs/FASE4F.md`.

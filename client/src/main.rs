@@ -2,7 +2,7 @@ mod media;
 
 use futures_util::{SinkExt, StreamExt};
 use iced::{
-    widget::{button, column, container, row, scrollable, text, text_input, Space},
+    widget::{button, column, container, row, scrollable, slider, text, text_input, Space},
     Alignment, Element, Length, Subscription, Task, Theme,
 };
 use serde::{Deserialize, Serialize};
@@ -31,11 +31,14 @@ enum Message {
     RoomIdChanged(String),
     PasswordChanged(String),
     Continue,
+    ChangeServer,
+    ConnectionClosed,
     CreateRoom,
     JoinRoom,
     ToggleMicrophone,
     ToggleDeafen,
-    CyclePeerVolume(String),
+    TogglePeerVolumePanel(String),
+    SetPeerVolume(String, u8),
     ToggleCamera,
     ToggleScreenShare,
     LeaveCall,
@@ -111,6 +114,7 @@ struct App {
     active_room: String,
     participants: Vec<Participant>,
     peer_volumes: HashMap<String, u8>,
+    open_volume_panel: Option<String>,
     network: Option<Network>,
     media_engine: Option<Arc<media::MediaEngine>>,
     local_user_id: Option<String>,
@@ -135,6 +139,7 @@ impl Default for App {
             active_room: String::new(),
             participants: Vec::new(),
             peer_volumes: HashMap::new(),
+            open_volume_panel: None,
             network: None,
             media_engine: None,
             local_user_id: None,
@@ -186,6 +191,27 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 Err(error) => app.status = format!("Falha na conexão: {error}"),
             }
         }
+        Message::ChangeServer => {
+            // The lobby has an established connection; dispose of it before editing URL.
+            let old_engine = app.media_engine.take();
+            app.network = None;
+            app.local_user_id = None;
+            app.active_room.clear();
+            app.participants.clear();
+            app.peer_volumes.clear();
+            app.open_volume_panel = None;
+            app.microphone_before_deafen = None;
+            app.deafened = false;
+            app.camera_enabled = false;
+            app.screen_sharing = false;
+            app.busy = false;
+            app.screen = Screen::Login;
+            app.status = "Conexão anterior encerrada. Você pode alterar o servidor.".into();
+            if let Some(engine) = old_engine {
+                return Task::perform(async move { engine.close_all().await; }, |_| Message::ConnectionClosed);
+            }
+        }
+        Message::ConnectionClosed => {}
         Message::CreateRoom => {
             if app.room_id.trim().is_empty() || app.password.is_empty() {
                 app.status = "Informe o ID e a senha da sala.".into();
@@ -250,18 +276,22 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 update_media(app);
             }
         }
-        Message::CyclePeerVolume(peer_id) => {
-            // Only remote participants may be adjusted, never the local client.
-            if !app.participants.iter().any(|p| p.user_id == peer_id)
-                || app.local_user_id.as_deref() == Some(peer_id.as_str()) {
-                return Task::none();
+        Message::TogglePeerVolumePanel(peer_id) => {
+            if !is_remote_participant(app, &peer_id) { return Task::none(); }
+            if app.open_volume_panel.as_deref() == Some(peer_id.as_str()) {
+                app.open_volume_panel = None;
+            } else {
+                app.open_volume_panel = Some(peer_id);
             }
-            let level = app.peer_volumes.entry(peer_id.clone()).or_insert(100);
-            *level = next_peer_volume(*level);
+        }
+        Message::SetPeerVolume(peer_id, percent) => {
+            if !is_remote_participant(app, &peer_id) { return Task::none(); }
+            let volume = percent.min(100);
+            app.peer_volumes.insert(peer_id.clone(), volume);
             if let Some(engine) = &app.media_engine {
-                engine.set_peer_volume(&peer_id, *level);
+                engine.set_peer_volume(&peer_id, volume);
             }
-            app.status = format!("Volume local do participante: {}%", level);
+            app.status = format!("Volume local do participante: {volume}%");
         }
         Message::ToggleCamera => {
             app.camera_enabled = !app.camera_enabled;
@@ -279,6 +309,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.active_room.clear();
                 app.participants.clear();
                 app.peer_volumes.clear();
+                app.open_volume_panel = None;
                 app.screen_sharing = false;
                 app.camera_enabled = false;
                 if let Some(previous) = app.microphone_before_deafen.take() { app.microphone_enabled = previous; }
@@ -290,6 +321,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.active_room.clear();
             app.participants.clear();
             app.peer_volumes.clear();
+            app.open_volume_panel = None;
             app.screen_sharing = false;
             app.camera_enabled = false;
             if let Some(previous) = app.microphone_before_deafen.take() { app.microphone_enabled = previous; }
@@ -306,6 +338,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.active_room = room_id;
                 app.participants = participants.clone();
                 app.peer_volumes.clear();
+                app.open_volume_panel = None;
                 app.screen = Screen::Call;
                 app.status = "Sala conectada; preparando áudio Opus P2P...".into();
                 if let Some(engine) = &app.media_engine {
@@ -337,6 +370,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             ServerEvent::ParticipantLeft { user_id, .. } => {
                 app.participants.retain(|p| p.user_id != user_id);
                 app.peer_volumes.remove(&user_id);
+                if app.open_volume_panel.as_deref() == Some(user_id.as_str()) { app.open_volume_panel = None; }
                 if let Some(engine) = app.media_engine.clone() {
                     return Task::perform(async move { engine.close_peer(&user_id).await; Ok(()) }, Message::PeerOperationResult);
                 }
@@ -360,11 +394,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 if let Some(previous) = app.microphone_before_deafen.take() { app.microphone_enabled = previous; }
                 app.deafened = false;
                 app.peer_volumes.clear();
+                app.open_volume_panel = None;
                 app.network = None;
                 app.screen = Screen::Login;
                 app.status = format!("Conexão encerrada: {reason}");
-                if let Some(engine) = app.media_engine.clone() {
-                    return Task::perform(async move { engine.close_all().await; Ok(()) }, Message::PeerOperationResult);
+                if let Some(engine) = app.media_engine.take() {
+                    return Task::perform(async move { engine.close_all().await; }, |_| Message::ConnectionClosed);
                 }
             }
         },
@@ -385,13 +420,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
     Task::none()
 }
 
-/// Three predictable volume steps, including complete local silence.
-fn next_peer_volume(current: u8) -> u8 {
-    match current {
-        100 => 50,
-        50 => 0,
-        _ => 100,
-    }
+fn is_remote_participant(app: &App, peer_id: &str) -> bool {
+    app.local_user_id.as_deref() != Some(peer_id)
+        && app.participants.iter().any(|p| p.user_id == peer_id)
 }
 
 fn signal_kind(payload: &serde_json::Value) -> &str {
@@ -521,6 +552,7 @@ fn lobby_view(app: &App) -> Element<'_, Message> {
             button("Criar sala").on_press(Message::CreateRoom).padding([10, 20]),
             button("Entrar na sala").on_press(Message::JoinRoom).padding([10, 20]),
         ].spacing(12),
+        button("Alterar servidor").on_press(Message::ChangeServer).padding([8, 14]),
         text("As salas existem enquanto houver participantes conectados.").size(13),
     ].spacing(14).width(Length::Fixed(440.0)).align_x(Alignment::Center))
         .padding(28).style(container::rounded_box).into()
@@ -529,41 +561,58 @@ fn lobby_view(app: &App) -> Element<'_, Message> {
 fn call_view(app: &App) -> Element<'_, Message> {
     let participant_list = app.participants.iter().fold(column![].spacing(8), |list, participant| {
         let mic = if participant.microphone_enabled { "Mic ligado" } else { "Mic mudo" };
-        let camera = if participant.camera_enabled { "Câmera ligada" } else { "Sem câmera" };
-        let screen = if participant.screen_sharing { "Compartilhando tela" } else { "" };
+        let camera = if participant.camera_enabled { "Câmera ligada (visual)" } else { "Sem câmera" };
+        let screen = if participant.screen_sharing { " · Tela ativa (visual)" } else { "" };
         let is_local = app.local_user_id.as_deref() == Some(participant.user_id.as_str());
         let volume = *app.peer_volumes.get(&participant.user_id).unwrap_or(&100);
+        let is_open = app.open_volume_panel.as_deref() == Some(participant.user_id.as_str());
         let participant_row = row![
             text("●").size(18).color(if participant.microphone_enabled { iced::Color::from_rgb(0.21, 0.72, 0.47) } else { iced::Color::from_rgb(0.89, 0.43, 0.43) }),
             column![
                 text(&participant.username).size(17),
-                text(format!("{mic} · {camera} {screen}")).size(12)
+                text(format!("{mic} · {camera}{screen}")).size(12)
                     .color(if participant.microphone_enabled { iced::Color::from_rgb(0.21, 0.72, 0.47) } else { iced::Color::from_rgb(0.89, 0.43, 0.43) })
             ].width(Length::Fill),
         ].spacing(12).align_y(Alignment::Center);
         let participant_row = if is_local {
             participant_row.push(text("Você").size(12))
         } else {
-            participant_row.push(
-                button(text(format!("Volume: {volume}%")).size(12)
+            // The watch button is intentionally inactive until a genuine video track exists.
+            participant_row
+                .push(button("Assistir (em breve)").padding([5, 9]))
+                .push(button(text(format!("🔊 {volume}%")).size(12)
                     .color(if volume == 0 { iced::Color::from_rgb(0.89, 0.43, 0.43) } else { iced::Color::from_rgb(0.21, 0.72, 0.47) }))
-                    .on_press(Message::CyclePeerVolume(participant.user_id.clone()))
-                    .padding([5, 9])
-            )
+                    .on_press(Message::TogglePeerVolumePanel(participant.user_id.clone()))
+                    .padding([5, 9]))
         };
-        list.push(
-            container(participant_row)
-                .padding([8, 14])
-                .height(Length::Fixed(54.0))
-                .width(Length::Fill)
-                .style(container::rounded_box)
-        )
+        let card = container(participant_row)
+            .padding([8, 14])
+            .height(Length::Fixed(54.0))
+            .width(Length::Fill)
+            .style(dark_card);
+        if !is_local && is_open {
+            let id = participant.user_id.clone();
+            let volume_control = container(column![
+                row![text("Volume individual").size(12), Space::with_width(Length::Fill), text(format!("{volume}%")).size(12)].align_y(Alignment::Center),
+                slider(0..=100, volume, move |value| Message::SetPeerVolume(id.clone(), value)).step(1),
+            ].spacing(6)).padding([10, 14]).width(Length::Fixed(260.0)).style(dark_popup);
+            list.push(column![card, row![Space::with_width(Length::Fill), volume_control].spacing(0)].spacing(4))
+        } else {
+            list.push(card)
+        }
     });
     let mic_button = button(text(if app.microphone_enabled { "Microfone: ligado" } else { "Microfone: mudo" })
         .color(if app.microphone_enabled { iced::Color::from_rgb(0.21, 0.72, 0.47) } else { iced::Color::from_rgb(0.89, 0.43, 0.43) }));
     let mic_button = if app.deafened { mic_button } else { mic_button.on_press(Message::ToggleMicrophone) };
     container(column![
-        row![column![text("Sala").size(13), text(&app.active_room).size(27)], Space::with_width(Length::Fill), text(format!("{} participante(s)", app.participants.len())).size(14)].align_y(Alignment::Center),
+        container(row![
+            column![text("Sala").size(13), text(&app.active_room).size(27)],
+            Space::with_width(Length::Fill),
+            text(format!("{} participante(s)", app.participants.len())).size(14),
+        ].align_y(Alignment::Center))
+            .padding(14)
+            .width(Length::Fill)
+            .style(dark_header),
         // Altura fixa: comporta cinco cartões de participante; o excedente usa scroll.
         container(scrollable(participant_list).height(Length::Fixed(310.0)))
             .width(Length::Fill)
@@ -587,17 +636,49 @@ fn call_view(app: &App) -> Element<'_, Message> {
         text(app.last_signal.as_deref().unwrap_or("Aguardando sinalização dos participantes...")).size(11)
             .color(iced::Color::from_rgb(0.62, 0.66, 0.72)),
     ].spacing(12).width(Length::Fill).height(Length::Shrink))
-        .padding(20).width(Length::Fill).style(container::rounded_box).into()
+        .padding(20).width(Length::Fill).style(dark_call_background).into()
+}
+
+fn dark_header(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(36, 40, 47))),
+        text_color: Some(iced::Color::from_rgb8(235, 239, 244)),
+        border: iced::Border { radius: 8.0.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+fn dark_card(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(46, 51, 60))),
+        border: iced::Border { radius: 7.0.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+fn dark_popup(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(39, 43, 51))),
+        border: iced::Border { radius: 7.0.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+fn dark_call_background(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(31, 34, 40))),
+        border: iced::Border { radius: 9.0.into(), ..Default::default() },
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
 mod volume_tests {
-    use super::next_peer_volume;
-
     #[test]
-    fn remote_volume_cycles_including_silence() {
-        assert_eq!(next_peer_volume(100), 50);
-        assert_eq!(next_peer_volume(50), 0);
-        assert_eq!(next_peer_volume(0), 100);
+    fn volume_slider_bounds_are_inclusive() {
+        assert_eq!(0u8.min(100), 0);
+        assert_eq!(50u8.min(100), 50);
+        assert_eq!(100u8.min(100), 100);
+        assert_eq!(255u8.min(100), 100);
     }
 }
