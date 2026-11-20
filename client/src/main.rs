@@ -2,11 +2,11 @@ mod media;
 
 use futures_util::{SinkExt, StreamExt};
 use iced::{
-    widget::{button, column, container, row, scrollable, slider, text, text_input, Space},
+    widget::{button, column, container, row, scrollable, slider, pick_list, text, text_input, Space},
     Alignment, Element, Length, Subscription, Task, Theme,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, VecDeque}, sync::{Arc, Mutex}};
+use std::{collections::{HashMap, HashSet, VecDeque}, sync::{Arc, Mutex}};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
@@ -38,8 +38,17 @@ enum Message {
     ToggleMicrophone,
     ToggleDeafen,
     TogglePeerVolumePanel(String),
+    ToggleVideoSubscription(String),
     SetPeerVolume(String, u8),
+    RefreshMicrophones,
+    MicrophonesListed(Result<Vec<String>, String>),
+    SelectMicrophone(String),
+    MicrophoneSelected(String, Result<(), String>),
     ToggleCamera,
+    RefreshCameras,
+    CamerasListed(Result<Vec<media::CameraDevice>, String>),
+    SelectCamera(String),
+    CameraResult(Result<bool, String>),
     ToggleScreenShare,
     LeaveCall,
     Connected(Result<(Network, Arc<media::MediaEngine>), String>),
@@ -114,6 +123,7 @@ struct App {
     active_room: String,
     participants: Vec<Participant>,
     peer_volumes: HashMap<String, u8>,
+    requested_video: HashSet<String>,
     open_volume_panel: Option<String>,
     network: Option<Network>,
     media_engine: Option<Arc<media::MediaEngine>>,
@@ -122,6 +132,14 @@ struct App {
     deafened: bool,
     microphone_before_deafen: Option<bool>,
     camera_enabled: bool,
+    microphones: Vec<String>,
+    selected_microphone: Option<String>,
+    microphone_switching: bool,
+    microphones_error: Option<String>,
+    cameras: Vec<media::CameraDevice>,
+    selected_camera: Option<String>,
+    camera_scan_error: Option<String>,
+    camera_scanning: bool,
     screen_sharing: bool,
     busy: bool,
     status: String,
@@ -139,6 +157,7 @@ impl Default for App {
             active_room: String::new(),
             participants: Vec::new(),
             peer_volumes: HashMap::new(),
+            requested_video: HashSet::new(),
             open_volume_panel: None,
             network: None,
             media_engine: None,
@@ -147,6 +166,14 @@ impl Default for App {
             deafened: false,
             microphone_before_deafen: None,
             camera_enabled: false,
+            microphones: Vec::new(),
+            selected_microphone: None,
+            microphone_switching: false,
+            microphones_error: None,
+            cameras: Vec::new(),
+            selected_camera: None,
+            camera_scan_error: None,
+            camera_scanning: false,
             screen_sharing: false,
             busy: false,
             status: "Servidor local: 127.0.0.1:3000".into(),
@@ -183,6 +210,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.microphone_before_deafen = None;
                     app.media_engine = Some(engine);
                     app.screen = Screen::Lobby;
+                    // Refresh CPAL endpoints after connecting; the saved preference is
+                    // applied at AudioRuntime startup, independently from camera.
+                    let devices = media::list_microphones();
+                    app.selected_microphone = media::active_input_label();
+                    app.microphones = devices.unwrap_or_default();
                     app.status = match audio_issue {
                         Some(issue) => format!("Conectado como {} · áudio indisponível: {issue}", app.username.trim()),
                         None => format!("Conectado como {} · microfone e reprodução preparados", app.username.trim()),
@@ -199,6 +231,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.active_room.clear();
             app.participants.clear();
             app.peer_volumes.clear();
+            app.requested_video.clear();
             app.open_volume_panel = None;
             app.microphone_before_deafen = None;
             app.deafened = false;
@@ -293,9 +326,120 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             app.status = format!("Volume local do participante: {volume}%");
         }
+        Message::ToggleVideoSubscription(peer_id) => {
+            if !is_remote_participant(app, &peer_id) { return Task::none(); }
+            let currently = app.requested_video.contains(&peer_id);
+            if let Some(engine) = &app.media_engine {
+                match engine.request_remote_camera(&peer_id, !currently) {
+                    Ok(()) => {
+                        if currently { app.requested_video.remove(&peer_id); }
+                        else { app.requested_video.insert(peer_id); }
+                        app.status = if currently { "Recepção VP8 suspensa para este participante.".into() }
+                            else { "Solicitando VP8; pacotes serão contados (imagem na Fase 5B).".into() };
+                    }
+                    Err(error) => app.status = format!("Falha ao solicitar VP8: {error}"),
+                }
+            }
+        }
+        Message::RefreshMicrophones => {
+            return Task::perform(async { media::list_microphones() }, Message::MicrophonesListed);
+        }
+        Message::MicrophonesListed(result) => {
+            match result {
+                Ok(devices) => {
+                    let previous = app.selected_microphone.clone();
+                    app.microphones = devices;
+                    app.selected_microphone = previous.filter(|v| app.microphones.contains(v));
+                    app.microphones_error = None;
+                    if app.microphones.is_empty() { app.status = " Nenhum microfone detectado.".into(); }
+                    else { app.status = format!(" {} microfone(s) disponível(is).", app.microphones.len()); }
+                }
+                Err(error) => { app.microphones_error = Some(error.clone()); app.status = format!("Erro ao listar microfones: {error}"); }
+            }
+        }
+        Message::SelectMicrophone(label) => {
+            if app.microphone_switching { return Task::none(); }
+            let Some(engine) = app.media_engine.clone() else { return Task::none(); };
+            if !app.microphones.contains(&label) { return Task::none(); }
+            if app.selected_microphone.as_deref() == Some(label.as_str()) { return Task::none(); }
+            app.microphone_switching = true;
+            let copy = label.clone();
+            return Task::perform(async move { engine.select_microphone(copy).await }, move |result| Message::MicrophoneSelected(label.clone(), result));
+        }
+        Message::MicrophoneSelected(label, result) => {
+            app.microphone_switching = false;
+            match result {
+                Ok(()) => {
+                    app.selected_microphone = Some(label.clone());
+                    app.status = match media::save_input_preference(&label) {
+                        Ok(()) => format!(" Microfone selecionado: {label}"),
+                        Err(e) => format!(" Microfone ativo: {label} (preferência não salva: {e})"),
+                    };
+                }
+                Err(error) => app.status = format!("Não foi possível trocar o microfone: {error}"),
+            }
+        }
+        Message::RefreshCameras => {
+            if app.camera_enabled { app.status = "Desligue a câmera antes de atualizar os dispositivos.".into(); return Task::none(); }
+            app.camera_scanning = true;
+            app.camera_scan_error = None;
+            return Task::perform(async { media::list_cameras() }, Message::CamerasListed);
+        }
+        Message::CamerasListed(result) => {
+            app.camera_scanning = false;
+            match result {
+                Ok(cameras) => {
+                    let old_id = app.selected_camera.as_ref().and_then(|path| app.cameras.iter().find(|camera| &camera.path == path)).map(|camera| camera.stable_id.clone());
+                    let preferred = old_id.or_else(media::preferred_camera_id);
+                    let selected = preferred.as_deref().and_then(|id| cameras.iter().find(|camera| camera.stable_id == id))
+                        .or_else(|| cameras.first());
+                    app.selected_camera = selected.map(|camera| camera.path.clone());
+                    app.cameras = cameras;
+                    app.camera_scan_error = None;
+                    app.status = if app.cameras.is_empty() { "Nenhuma câmera disponível. Conecte uma webcam ou inicie uma câmera virtual e clique Atualizar câmeras.".into() }
+                        else { format!("{} câmera(s) detectada(s). Escolha qual deseja usar.", app.cameras.len()) };
+                }
+                Err(error) => { app.camera_scan_error = Some(error.clone()); app.status = format!("Não foi possível detectar câmeras: {error}"); }
+            }
+        }
+        Message::SelectCamera(label) => {
+            if app.camera_enabled { app.status = "Desligue a câmera antes de trocar o dispositivo.".into(); return Task::none(); }
+            if let Some(camera) = app.cameras.iter().find(|camera| camera.label() == label) {
+                app.selected_camera = Some(camera.path.clone());
+                if let Err(error) = media::save_preferred_camera(camera) {
+                    app.status = format!("Câmera escolhida, mas preferência não foi salva: {error}");
+                } else { app.status = format!("Câmera selecionada: {}", camera.name); }
+            }
+        }
         Message::ToggleCamera => {
-            app.camera_enabled = !app.camera_enabled;
-            update_media(app);
+            if app.media_engine.is_none() || app.screen != Screen::Call { return Task::none(); }
+            let enabled = !app.camera_enabled;
+            let device = if enabled {
+                match app.selected_camera.as_ref().filter(|path| app.cameras.iter().any(|camera| &camera.path == *path)) {
+                    Some(path) => path.clone(),
+                    None => { app.status = "Nenhuma câmera selecionada. Clique Atualizar câmeras.".into(); return Task::none(); }
+                }
+            } else { String::new() };
+            let engine = app.media_engine.clone().unwrap();
+            app.status = if enabled { "Iniciando webcam via FFmpeg...".into() }
+                else { "Parando webcam...".into() };
+            return Task::perform(async move {
+                engine.set_camera_enabled(enabled, &device).await.map(|_| enabled)
+            }, Message::CameraResult);
+        }
+        Message::CameraResult(result) => {
+            if app.screen != Screen::Call { return Task::none(); }
+            match result {
+            Ok(enabled) => {
+                app.camera_enabled = enabled;
+                update_media(app);
+                app.status = if enabled {
+                    "Câmera capturando VP8; envio só para participantes inscritos (visualização na 5B).".into()
+                } else { "Câmera desligada; captura interrompida.".into() };
+            }
+            Err(error) => { app.camera_enabled = false; update_media(app);
+                app.status = format!("Falha ao iniciar webcam: {error}"); }
+            }
         }
         Message::ToggleScreenShare => {
             app.screen_sharing = !app.screen_sharing;
@@ -309,6 +453,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.active_room.clear();
                 app.participants.clear();
                 app.peer_volumes.clear();
+            app.requested_video.clear();
                 app.open_volume_panel = None;
                 app.screen_sharing = false;
                 app.camera_enabled = false;
@@ -321,6 +466,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.active_room.clear();
             app.participants.clear();
             app.peer_volumes.clear();
+            app.requested_video.clear();
             app.open_volume_panel = None;
             app.screen_sharing = false;
             app.camera_enabled = false;
@@ -338,6 +484,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.active_room = room_id;
                 app.participants = participants.clone();
                 app.peer_volumes.clear();
+            app.requested_video.clear();
                 app.open_volume_panel = None;
                 app.screen = Screen::Call;
                 app.status = "Sala conectada; preparando áudio Opus P2P...".into();
@@ -355,6 +502,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         Some(Task::perform(async move { engine.create_offer(&peer).await }, Message::PeerOperationResult))
                     } else { None }
                 }).collect::<Vec<_>>();
+                let mut tasks = tasks;
+                app.camera_scanning = true;
+                tasks.push(Task::perform(async { media::list_cameras() }, Message::CamerasListed));
                 return Task::batch(tasks);
             }
             ServerEvent::ParticipantJoined { user_id, username } => {
@@ -370,6 +520,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             ServerEvent::ParticipantLeft { user_id, .. } => {
                 app.participants.retain(|p| p.user_id != user_id);
                 app.peer_volumes.remove(&user_id);
+                app.requested_video.remove(&user_id);
                 if app.open_volume_panel.as_deref() == Some(user_id.as_str()) { app.open_volume_panel = None; }
                 if let Some(engine) = app.media_engine.clone() {
                     return Task::perform(async move { engine.close_peer(&user_id).await; Ok(()) }, Message::PeerOperationResult);
@@ -381,6 +532,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     p.microphone_enabled = microphone_enabled;
                     p.camera_enabled = camera_enabled;
                     p.screen_sharing = screen_sharing;
+                }
+                if !camera_enabled && app.requested_video.remove(&user_id) {
+                    if let Some(engine) = &app.media_engine {
+                        let _ = engine.request_remote_camera(&user_id, false);
+                    }
                 }
             }
             ServerEvent::WebrtcSignal { from_user, payload } => {
@@ -394,6 +550,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 if let Some(previous) = app.microphone_before_deafen.take() { app.microphone_enabled = previous; }
                 app.deafened = false;
                 app.peer_volumes.clear();
+            app.requested_video.clear();
                 app.open_volume_panel = None;
                 app.network = None;
                 app.screen = Screen::Login;
@@ -552,91 +709,173 @@ fn lobby_view(app: &App) -> Element<'_, Message> {
             button("Criar sala").on_press(Message::CreateRoom).padding([10, 20]),
             button("Entrar na sala").on_press(Message::JoinRoom).padding([10, 20]),
         ].spacing(12),
-        button("Alterar servidor").on_press(Message::ChangeServer).padding([8, 14]),
+        button(" Alterar servidor").on_press(Message::ChangeServer).padding([8, 14]),
         text("As salas existem enquanto houver participantes conectados.").size(13),
     ].spacing(14).width(Length::Fixed(440.0)).align_x(Alignment::Center))
         .padding(28).style(container::rounded_box).into()
 }
 
 fn call_view(app: &App) -> Element<'_, Message> {
+    // Both inputs share a single row. They change independent media sources:
+    // SelectCamera only updates video; SelectMicrophone only updates audio.
+    let camera_input = container(column![
+        text("Camera").size(13),
+        pick_list(
+            app.cameras.iter().map(|camera| camera.label()).collect::<Vec<_>>(),
+            app.selected_camera.as_ref()
+                .and_then(|path| app.cameras.iter().find(|camera| &camera.path == path))
+                .map(|camera| camera.label()),
+            Message::SelectCamera,
+        )
+        .placeholder(if app.cameras.is_empty() { "Nenhuma camera disponivel" } else { "Selecionar camera" })
+        .width(Length::Fill),
+        button(if app.camera_scanning { "Procurando..." } else { "Atualizar cameras" })
+            .on_press_maybe((!app.camera_scanning && !app.camera_enabled).then_some(Message::RefreshCameras))
+            .padding([5, 9]),
+        text(app.camera_scan_error.as_deref().unwrap_or(
+            if app.cameras.is_empty() { "Conecte uma webcam ou camera virtual." } else { "Dispositivo de video independente do microfone." }
+        )).size(11).color(if app.cameras.is_empty() || app.camera_scan_error.is_some() {
+            iced::Color::from_rgb(0.89, 0.43, 0.43)
+        } else { iced::Color::from_rgb(0.64, 0.69, 0.76) }),
+    ].spacing(6)).width(Length::FillPortion(1)).padding(12).style(dark_card);
+
+    let microphone_input = container(column![
+        text("Microfone").size(13),
+        pick_list(app.microphones.clone(), app.selected_microphone.clone(), Message::SelectMicrophone)
+            .placeholder(if app.microphones.is_empty() { "Nenhum microfone disponivel" } else { "Selecionar microfone" })
+            .width(Length::Fill),
+        button(if app.microphone_switching { "Alterando..." } else { "Atualizar microfones" })
+            .on_press_maybe((!app.microphone_switching).then_some(Message::RefreshMicrophones))
+            .padding([5, 9]),
+        text(app.microphones_error.as_deref().unwrap_or("Fonte de audio independente da camera."))
+            .size(11).color(if app.microphones_error.is_some() {
+                iced::Color::from_rgb(0.89, 0.43, 0.43)
+            } else { iced::Color::from_rgb(0.64, 0.69, 0.76) }),
+    ].spacing(6)).width(Length::FillPortion(1)).padding(12).style(dark_card);
+
+    let device_row = row![camera_input, microphone_input].spacing(12).width(Length::Fill);
+
     let participant_list = app.participants.iter().fold(column![].spacing(8), |list, participant| {
         let mic = if participant.microphone_enabled { "Mic ligado" } else { "Mic mudo" };
-        let camera = if participant.camera_enabled { "Câmera ligada (visual)" } else { "Sem câmera" };
+        let camera = if participant.camera_enabled { "Camera ligada (VP8)" } else { "Sem camera" };
         let screen = if participant.screen_sharing { " · Tela ativa (visual)" } else { "" };
         let is_local = app.local_user_id.as_deref() == Some(participant.user_id.as_str());
         let volume = *app.peer_volumes.get(&participant.user_id).unwrap_or(&100);
         let is_open = app.open_volume_panel.as_deref() == Some(participant.user_id.as_str());
         let participant_row = row![
-            text("●").size(18).color(if participant.microphone_enabled { iced::Color::from_rgb(0.21, 0.72, 0.47) } else { iced::Color::from_rgb(0.89, 0.43, 0.43) }),
+            text("●").size(16).color(if participant.microphone_enabled {
+                iced::Color::from_rgb(0.21, 0.72, 0.47)
+            } else { iced::Color::from_rgb(0.89, 0.43, 0.43) }),
             column![
-                text(&participant.username).size(17),
-                text(format!("{mic} · {camera}{screen}")).size(12)
-                    .color(if participant.microphone_enabled { iced::Color::from_rgb(0.21, 0.72, 0.47) } else { iced::Color::from_rgb(0.89, 0.43, 0.43) })
-            ].width(Length::Fill),
-        ].spacing(12).align_y(Alignment::Center);
+                text(&participant.username).size(14),
+                text(format!("{mic} · {camera}{screen}")).size(10)
+                    .color(if participant.microphone_enabled {
+                        iced::Color::from_rgb(0.21, 0.72, 0.47)
+                    } else { iced::Color::from_rgb(0.89, 0.43, 0.43) }),
+            ].spacing(3).width(Length::Fill),
+        ].spacing(7).align_y(Alignment::Center);
         let participant_row = if is_local {
-            participant_row.push(text("Você").size(12))
+            participant_row.push(text("Voce").size(11))
         } else {
-            // The watch button is intentionally inactive until a genuine video track exists.
-            participant_row
-                .push(button("Assistir (em breve)").padding([5, 9]))
-                .push(button(text(format!("🔊 {volume}%")).size(12)
-                    .color(if volume == 0 { iced::Color::from_rgb(0.89, 0.43, 0.43) } else { iced::Color::from_rgb(0.21, 0.72, 0.47) }))
-                    .on_press(Message::TogglePeerVolumePanel(participant.user_id.clone()))
-                    .padding([5, 9]))
+            let subscribed = app.requested_video.contains(&participant.user_id);
+            let video_button = button(if subscribed { "Parar VP8" } else { "Receber VP8" })
+                .padding([5, 7]);
+            let video_button = if participant.camera_enabled || subscribed {
+                video_button.on_press(Message::ToggleVideoSubscription(participant.user_id.clone()))
+            } else { video_button };
+            // Compact two-line card avoids squeezing the sidebar.
+            let volume_button = button(text(format!("Volume {volume}%")).size(11))
+                .on_press(Message::TogglePeerVolumePanel(participant.user_id.clone()))
+                .padding([5, 7]);
+            let card = container(column![
+                participant_row,
+                row![video_button, volume_button].spacing(5),
+            ].spacing(6)).width(Length::Fill).padding(8).style(dark_card);
+            if is_open {
+                let id = participant.user_id.clone();
+                let volume_control = container(column![
+                    text(format!("Volume: {volume}%")).size(11),
+                    slider(0..=100, volume, move |value| Message::SetPeerVolume(id.clone(), value)).step(1),
+                ].spacing(5)).padding(8).width(Length::Fill).style(dark_popup);
+                return list.push(column![card, volume_control].spacing(4));
+            }
+            return list.push(card);
         };
-        let card = container(participant_row)
-            .padding([8, 14])
-            .height(Length::Fixed(54.0))
-            .width(Length::Fill)
-            .style(dark_card);
-        if !is_local && is_open {
-            let id = participant.user_id.clone();
-            let volume_control = container(column![
-                row![text("Volume individual").size(12), Space::with_width(Length::Fill), text(format!("{volume}%")).size(12)].align_y(Alignment::Center),
-                slider(0..=100, volume, move |value| Message::SetPeerVolume(id.clone(), value)).step(1),
-            ].spacing(6)).padding([10, 14]).width(Length::Fixed(260.0)).style(dark_popup);
-            list.push(column![card, row![Space::with_width(Length::Fill), volume_control].spacing(0)].spacing(4))
-        } else {
-            list.push(card)
-        }
+        list.push(container(participant_row).width(Length::Fill).padding(8).style(dark_card))
     });
+
     let mic_button = button(text(if app.microphone_enabled { "Microfone: ligado" } else { "Microfone: mudo" })
-        .color(if app.microphone_enabled { iced::Color::from_rgb(0.21, 0.72, 0.47) } else { iced::Color::from_rgb(0.89, 0.43, 0.43) }));
+        .color(if app.microphone_enabled {
+            iced::Color::from_rgb(0.21, 0.72, 0.47)
+        } else { iced::Color::from_rgb(0.89, 0.43, 0.43) }))
+        .width(Length::Fill);
     let mic_button = if app.deafened { mic_button } else { mic_button.on_press(Message::ToggleMicrophone) };
-    container(column![
-        container(row![
-            column![text("Sala").size(13), text(&app.active_room).size(27)],
-            Space::with_width(Length::Fill),
-            text(format!("{} participante(s)", app.participants.len())).size(14),
-        ].align_y(Alignment::Center))
-            .padding(14)
-            .width(Length::Fill)
-            .style(dark_header),
-        // Altura fixa: comporta cinco cartões de participante; o excedente usa scroll.
+
+    let sidebar = container(column![
+        container(column![
+            text("Sala").size(12),
+            text(&app.active_room).size(20),
+            text(format!("{} participante(s)", app.participants.len())).size(12),
+        ].spacing(6)).padding(12).width(Length::Fill).style(dark_header),
+        text("Controles").size(17),
+        mic_button,
+        button(text(if app.camera_enabled { "Camera: ligada (VP8)" } else { "Camera: desligada" })
+            .color(if app.camera_enabled {
+                iced::Color::from_rgb(0.21, 0.72, 0.47)
+            } else { iced::Color::from_rgb(0.89, 0.43, 0.43) }))
+            .on_press_maybe((app.camera_enabled || (app.selected_camera.is_some() && !app.camera_scanning))
+                .then_some(Message::ToggleCamera))
+            .width(Length::Fill),
+        button(text(if app.screen_sharing { "Parar tela (visual)" } else { "Compartilhar tela (visual)" })
+            .color(if app.screen_sharing {
+                iced::Color::from_rgb(0.21, 0.72, 0.47)
+            } else { iced::Color::from_rgb(0.89, 0.43, 0.43) }))
+            .on_press(Message::ToggleScreenShare)
+            .width(Length::Fill),
+        button(text(if app.deafened { "Ensurdecido: ligado" } else { "Ensurdecer" })
+            .color(if app.deafened {
+                iced::Color::from_rgb(0.89, 0.43, 0.43)
+            } else { iced::Color::from_rgb(0.21, 0.72, 0.47) }))
+            .on_press(Message::ToggleDeafen)
+            .width(Length::Fill),
+        button("Sair da sala").on_press(Message::LeaveCall).width(Length::Fill),
+        text("Participantes").size(17),
+        // Preserved fixed 310px region, with scrolling for overflow.
         container(scrollable(participant_list).height(Length::Fixed(310.0)))
-            .width(Length::Fill)
-            .padding(8),
-        row![
-            mic_button,
-            button(text(if app.camera_enabled { "Câmera: ligada (visual)" } else { "Câmera: desligada (visual)" })
-                .color(if app.camera_enabled { iced::Color::from_rgb(0.21, 0.72, 0.47) } else { iced::Color::from_rgb(0.89, 0.43, 0.43) }))
-                .on_press(Message::ToggleCamera),
-            button(text(if app.screen_sharing { "Parar compartilhamento (visual)" } else { "Compartilhar tela (visual)" }).color(if app.screen_sharing { iced::Color::from_rgb(0.21, 0.72, 0.47) } else { iced::Color::from_rgb(0.89, 0.43, 0.43) })).on_press(Message::ToggleScreenShare),
-            button("Sair").on_press(Message::LeaveCall),
-        ].spacing(10).align_y(Alignment::Center),
-        row![
-            button(text(if app.deafened { "Ensurdecido: ligado" } else { "Ensurdecer" })
-                .color(if app.deafened { iced::Color::from_rgb(0.89, 0.43, 0.43) } else { iced::Color::from_rgb(0.21, 0.72, 0.47) }))
-                .on_press(Message::ToggleDeafen),
-            text("Silencia a recepção e muta o microfone; ao voltar, restaura o mute anterior.").size(12),
-        ].spacing(12).align_y(Alignment::Center),
-        text(if app.media_engine.as_ref().is_some_and(|e| e.audio_error().is_none()) { "Áudio: Opus 48 kHz P2P preparado (aguardando fluxo remoto)" } else { "Áudio indisponível: verifique dispositivos e permissões" }).size(13)
-            .color(if app.media_engine.as_ref().is_some_and(|e| e.audio_error().is_none()) { iced::Color::from_rgb(0.21, 0.72, 0.47) } else { iced::Color::from_rgb(0.89, 0.43, 0.43) }),
-        text(app.last_signal.as_deref().unwrap_or("Aguardando sinalização dos participantes...")).size(11)
-            .color(iced::Color::from_rgb(0.62, 0.66, 0.72)),
-    ].spacing(12).width(Length::Fill).height(Length::Shrink))
-        .padding(20).width(Length::Fill).style(dark_call_background).into()
+            .width(Length::Fill),
+    ].spacing(10).width(Length::Fill))
+        .padding(12).width(Length::Fixed(290.0)).height(Length::Fill)
+        .style(dark_call_background);
+
+    let stream_area = container(column![
+        text("Area de transmissoes").size(23),
+        text("O video recebido ainda nao e renderizado nesta fase.").size(14)
+            .color(iced::Color::from_rgb(0.64, 0.69, 0.76)),
+        text("Para testar a recepcao opcional, use Receber VP8 no cartao do participante.")
+            .size(12).color(iced::Color::from_rgb(0.64, 0.69, 0.76)),
+    ].spacing(12).align_x(Alignment::Center))
+        .center_x(Length::Fill).center_y(Length::Fill)
+        .width(Length::Fill).height(Length::Fill).style(dark_call_background);
+
+    let media_status = if app.media_engine.as_ref().is_some_and(|e| e.audio_error().is_none()) {
+        "Audio: Opus 48 kHz P2P preparado (aguardando fluxo remoto)"
+    } else { "Audio indisponivel: verifique dispositivos e permissoes" };
+
+    let main_content = column![
+        container(text("Chamada  /  Transmissoes").size(17))
+            .padding([12, 16]).width(Length::Fill).style(dark_header),
+        device_row,
+        stream_area,
+        text(media_status).size(12).color(if app.media_engine.as_ref().is_some_and(|e| e.audio_error().is_none()) {
+            iced::Color::from_rgb(0.21, 0.72, 0.47)
+        } else { iced::Color::from_rgb(0.89, 0.43, 0.43) }),
+        text(app.last_signal.as_deref().unwrap_or("Aguardando sinalizacao dos participantes..."))
+            .size(11).color(iced::Color::from_rgb(0.62, 0.66, 0.72)),
+    ].spacing(12).width(Length::Fill).height(Length::Fill);
+
+    container(row![sidebar, container(main_content).padding(12).width(Length::Fill).height(Length::Fill)]
+        .spacing(8).height(Length::Fill))
+        .width(Length::Fill).height(Length::Fill).style(dark_call_background).into()
 }
 
 fn dark_header(_theme: &Theme) -> container::Style {

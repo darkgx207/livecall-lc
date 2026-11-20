@@ -2674,6 +2674,7 @@ dependencies = [
  "cpal",
  "futures-util",
  "iced",
+ "libc",
  "opus",
  "serde",
  "serde_json",

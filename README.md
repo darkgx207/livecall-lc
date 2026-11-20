@@ -29,3 +29,12 @@ Na tela de chamada, use o botão **Volume** ao lado de cada participante remoto 
 ## Fase 4F
 
 Inclui alteração do servidor no lobby, volume individual contínuo com slider, paleta escura e botão Assistir preparado (inativo até haver vídeo real). Consulte `docs/FASE4F.md`.
+
+
+## Fase 5A — câmera VP8 (experimental)
+
+Captura via FFmpeg, track WebRTC VP8 por peer e assinatura opcional de RTP (ainda sem renderização). Veja `docs/FASE5A.md` para dependências, testes e limitações.
+
+### Câmeras no Linux — Fase 5A.1
+
+O LiveCall agora lista dispositivos V4L2 de captura no cabeçalho da chamada, permite selecionar webcam (inclusive virtual/OBS), atualizar a lista e informa quando nenhuma câmera está disponível. Veja `docs/FASE5A1.md` para testes e limitações. O vídeo ainda não é renderizado nesta fase.

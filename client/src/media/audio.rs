@@ -66,16 +66,73 @@ impl Playback {
     }
 }
 
+/// Enumerate actual CPAL capture endpoints. A webcam's microphone is a separate
+/// audio device, so camera selection never changes this choice.
+pub fn input_devices() -> Result<Vec<String>, String> {
+    let host = cpal::default_host();
+    let devices = host.input_devices().map_err(|e| format!("listar microfones: {e}"))?;
+    Ok(devices.enumerate().map(|(i, device)| {
+        format!("{} · {}", i + 1, device.name().unwrap_or_else(|_| "Microfone sem nome".into()))
+    }).collect())
+}
+
+pub fn active_input_label() -> Option<String> {
+    let host = cpal::default_host();
+    let desired = saved_input_name();
+    let active = desired.and_then(|name| host.input_devices().ok()?.find(|d| d.name().ok().as_deref() == Some(name.as_str())))
+        .or_else(|| host.default_input_device())?;
+    let active_name = active.name().ok()?;
+    input_devices().ok()?.into_iter().find(|label| label.split_once(" · ").is_some_and(|(_, n)| n == active_name))
+}
+
+fn input_by_label(label: &str) -> Result<cpal::Device, String> {
+    let index = label.split_once(" · ").and_then(|(i, _)| i.parse::<usize>().ok())
+        .and_then(|i| i.checked_sub(1)).ok_or("Seleção de microfone inválida")?;
+    let devices = cpal::default_host().input_devices().map_err(|e| format!("listar microfones: {e}"))?;
+    let device = devices.into_iter().nth(index).ok_or("Microfone desconectado: atualize a lista")?;
+    let name = device.name().map_err(|e| format!("nome do microfone: {e}"))?;
+    if label != format!("{} · {}", index + 1, name) { return Err("Lista de microfones mudou: atualize os dispositivos".into()); }
+    Ok(device)
+}
+
+fn preference_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config/livecall/microphone.txt"))
+}
+fn saved_input_name() -> Option<String> {
+    std::fs::read_to_string(preference_path()?).ok().map(|s| s.trim().to_owned())
+}
+pub fn save_input_preference(label: &str) -> Result<(), String> {
+    let path = preference_path().ok_or("HOME indisponível para salvar preferência")?;
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let name = label.split_once(" · ").map(|(_, n)| n).unwrap_or(label);
+    std::fs::write(path, name).map_err(|e| format!("salvar microfone: {e}"))
+}
+
+enum DeviceCommand {
+    Select(String, std_mpsc::SyncSender<Result<(), String>>),
+    Shutdown,
+}
+
 pub struct AudioRuntime {
     pub playback: Arc<Playback>,
     muted: Arc<AtomicBool>,
-    shutdown: std_mpsc::Sender<()>,
+    device_commands: std_mpsc::Sender<DeviceCommand>,
 }
 impl AudioRuntime {
     pub fn set_muted(&self, value: bool) { self.muted.store(value, Ordering::Relaxed); }
+    /// Switches only the capture stream; output mixer, WebRTC track and mute stay intact.
+    pub fn select_input(&self, label: String) -> Result<(), String> {
+        let (tx, rx) = std_mpsc::sync_channel(1);
+        self.device_commands.send(DeviceCommand::Select(label, tx)).map_err(|_| "thread de áudio encerrada".to_string())?;
+        rx.recv_timeout(std::time::Duration::from_secs(5)).map_err(|e| format!("trocar microfone: {e}"))?
+    }
     pub fn start() -> Result<(Self, Receiver<Vec<u8>>), String> {
         let host = cpal::default_host();
-        let input = host.default_input_device().ok_or("microfone padrão não encontrado")?;
+        let input = match saved_input_name() {
+            Some(saved_name) => host.input_devices().ok().and_then(|mut devices| devices.find(|d| d.name().ok().as_deref() == Some(saved_name.as_str())))
+                .or_else(|| host.default_input_device()),
+            None => host.default_input_device(),
+        }.ok_or("microfone padrão não encontrado")?;
         let output = host.default_output_device().ok_or("dispositivo de saída padrão não encontrado")?;
         let in_format = input.default_input_config().map_err(|e| format!("configuração do microfone: {e}"))?;
         let out_format = output.default_output_config().map_err(|e| format!("configuração do alto-falante: {e}"))?;
@@ -83,11 +140,12 @@ impl AudioRuntime {
         let (pcm_tx, pcm_rx) = std_mpsc::sync_channel::<Vec<f32>>(12);
         // Bound encoded frames to ~240 ms; drop new frames instead of building latency.
         let (encoded_tx, encoded_rx) = tokio::sync::mpsc::channel(12);
-        let (shutdown_tx, shutdown_rx) = std_mpsc::channel();
+        let (device_tx, device_rx) = std_mpsc::channel();
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let muted = Arc::new(AtomicBool::new(false));
         let capture_muted = muted.clone();
         let speaker = playback.clone();
+        let switch_pcm_tx = pcm_tx.clone();
         thread::Builder::new().name("livecall-audio-device".into()).spawn(move || {
             // Keeping streams on the device thread avoids assumptions about Stream: Send.
             let built: Result<(cpal::Stream, cpal::Stream), String> = (|| {
@@ -98,9 +156,26 @@ impl AudioRuntime {
                 Ok((input_stream, output_stream))
             })();
             match built {
-                Ok((_capture, _speaker)) => {
+                Ok((mut capture, _speaker)) => {
                     let _ = ready_tx.send(Ok(()));
-                    let _ = shutdown_rx.recv();
+                    while let Ok(command) = device_rx.recv() {
+                        match command {
+                            DeviceCommand::Shutdown => break,
+                            DeviceCommand::Select(label, reply) => {
+                                let changed: Result<cpal::Stream, String> = (|| {
+                                    let next = input_by_label(&label)?;
+                                    let cfg = next.default_input_config().map_err(|e| format!("configurar microfone: {e}"))?;
+                                    let stream = make_input(&next, cfg.config(), cfg.sample_format(), switch_pcm_tx.clone())?;
+                                    stream.play().map_err(|e| format!("iniciar microfone: {e}"))?;
+                                    Ok(stream)
+                                })();
+                                match changed {
+                                    Ok(stream) => { capture = stream; let _ = reply.send(Ok(())); }
+                                    Err(error) => { let _ = reply.send(Err(error)); }
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(error) => { let _ = ready_tx.send(Err(error)); }
             }
@@ -128,11 +203,11 @@ impl AudioRuntime {
                 }
             }
         }).map_err(|e| format!("thread Opus: {e}"))?;
-        Ok((Self { playback, muted, shutdown: shutdown_tx }, encoded_rx))
+        Ok((Self { playback, muted, device_commands: device_tx }, encoded_rx))
     }
 }
 impl Drop for AudioRuntime {
-    fn drop(&mut self) { let _ = self.shutdown.send(()); }
+    fn drop(&mut self) { let _ = self.device_commands.send(DeviceCommand::Shutdown); }
 }
 
 pub async fn decode_remote(peer: String, track: Arc<webrtc::track::track_remote::TrackRemote>, playback: Arc<Playback>) {

@@ -1,8 +1,13 @@
 //! WebRTC P2P signaling and Opus audio for LiveCall (subphase 4B).
 mod audio;
+mod video;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use bytes::Bytes;
 use audio::AudioRuntime;
+pub use audio::{input_devices as list_microphones, save_input_preference, active_input_label};
+use video::CameraRuntime;
+pub use video::{CameraDevice, list_cameras, preferred_camera_id, save_preferred_camera};
+use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc::UnboundedSender, Mutex};
 use webrtc::{
@@ -55,6 +60,9 @@ pub struct MediaEngine {
     audio: Option<Arc<AudioRuntime>>,
     audio_track: Option<Arc<TrackLocalStaticSample>>,
     audio_error: Option<String>,
+    camera: Arc<CameraRuntime>,
+    video_subscribers: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    video_workers: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
 }
 
 impl std::fmt::Debug for MediaEngine {
@@ -90,10 +98,25 @@ impl MediaEngine {
                 (None, None, Some(error))
             }
         };
-        Ok(Self { api: Arc::new(api), peers: Arc::new(Mutex::new(HashMap::new())), pending_ice: Arc::new(Mutex::new(HashMap::new())), outbound, max_peers: config.max_peers, ice_servers: config.ice_servers, audio, audio_track, audio_error })
+        Ok(Self { api: Arc::new(api), peers: Arc::new(Mutex::new(HashMap::new())), pending_ice: Arc::new(Mutex::new(HashMap::new())), outbound, max_peers: config.max_peers, ice_servers: config.ice_servers, audio, audio_track, audio_error, camera: Arc::new(CameraRuntime::new()), video_subscribers: Arc::new(Mutex::new(HashMap::new())), video_workers: Arc::new(Mutex::new(HashMap::new())) })
     }
 
     pub fn audio_error(&self) -> Option<&str> { self.audio_error.as_deref() }
+    pub async fn select_microphone(&self, label: String) -> Result<(), String> {
+        let audio = self.audio.clone().ok_or("Áudio indisponível")?;
+        tokio::task::spawn_blocking(move || audio.select_input(label)).await.map_err(|e| e.to_string())?
+    }
+
+    pub async fn set_camera_enabled(&self, enabled: bool, device: &str) -> Result<(), String> {
+        if enabled { self.camera.start(device).await } else { self.camera.stop().await; Ok(()) }
+    }
+    pub fn camera_running(&self) -> bool { self.camera.is_running() }
+    /// Request/rescind a VP8 stream from a remote peer, without touching the audio track.
+    /// Rendering is a separate milestone (5B); the call only changes network subscription.
+    pub fn request_remote_camera(&self, peer_id: &str, enabled: bool) -> Result<(), String> {
+        send_signal(&self.outbound, peer_id, json!({"kind":"video_subscribe", "enabled": enabled}))
+    }
+
     pub fn set_deafened(&self, enabled: bool) {
         if let Some(audio) = &self.audio { audio.playback.set_deafened(enabled); }
     }
@@ -139,8 +162,21 @@ impl MediaEngine {
                 let playback = playback.clone();
                 let remote_id = remote_id.clone();
                 Box::pin(async move {
-                    // Each track gets its own Opus decoder; only remote audio reaches the mixer.
-                    tokio::spawn(audio::decode_remote(remote_id, track, playback));
+                    // Only Opus goes to the audio decoder. VP8 decoding/rendering is 5B.
+                    let codec = track.codec().capability.mime_type;
+                    if codec.eq_ignore_ascii_case("audio/opus") {
+                        tokio::spawn(audio::decode_remote(remote_id, track, playback));
+                    } else if codec.eq_ignore_ascii_case("video/vp8") {
+                        tokio::spawn(async move {
+                            let mut received = 0_u64;
+                            while track.read_rtp().await.is_ok() {
+                                received += 1;
+                                if received % 100 == 0 {
+                                    eprintln!("[Vídeo] {remote_id}: {received} pacotes VP8 recebidos (sem exibição na 5A)");
+                                }
+                            }
+                        });
+                    }
                 })
             }));
         }
@@ -151,6 +187,33 @@ impl MediaEngine {
                 while sender.read_rtcp().await.is_ok() {}
             });
         }
+        // One VP8 sender per peer, initially idle. No video RTP is sent unless
+        // that specific peer explicitly subscribes through signaling.
+        let video_track = Arc::new(TrackLocalStaticSample::new(
+            RTCRtpCodecCapability { mime_type: "video/VP8".into(), clock_rate: 90_000,
+                channels: 0, sdp_fmtp_line: String::new(), rtcp_feedback: vec![] },
+            "livecall-camera".into(), "livecall-video".into(),
+        ));
+        let video_sender = pc.add_track(video_track.clone() as Arc<dyn TrackLocal + Send + Sync>)
+            .await.map_err(|e| format!("adicionar track VP8: {e}"))?;
+        tokio::spawn(async move { while video_sender.read_rtcp().await.is_ok() {} });
+        let subscribed = Arc::new(AtomicBool::new(false));
+        self.video_subscribers.lock().await.insert(peer_id.to_string(), subscribed.clone());
+        let mut frames = self.camera.subscribe();
+        let video_worker = tokio::spawn(async move {
+            loop {
+                match frames.recv().await {
+                    Ok(frame) if subscribed.load(Ordering::Acquire) => {
+                        if let Err(error) = video_track.write_sample(&Sample {
+                            data: Bytes::from(frame.data), duration: frame.duration, ..Default::default()
+                        }).await { eprintln!("[Vídeo] escrita RTP: {error}"); }
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        self.video_workers.lock().await.insert(peer_id.to_string(), video_worker);
         // Data channel remains available for diagnostics and transport keepalive.
         pc.create_data_channel("livecall-control", None).await.map_err(|e| e.to_string())?;
         let mut peers = self.peers.lock().await;
@@ -184,6 +247,15 @@ impl MediaEngine {
                 pc.set_remote_description(RTCSessionDescription::answer(sdp.to_string()).map_err(|e| e.to_string())?).await.map_err(|e| e.to_string())?;
                 self.flush_pending_ice(peer_id, &pc).await
             }
+            "video_subscribe" => {
+                let enabled = payload.get("enabled").and_then(Value::as_bool).ok_or("video_subscribe sem enabled")?;
+                // Unknown peer cannot activate a track. Audio remains independent.
+                let peers = self.video_subscribers.lock().await;
+                if let Some(subscription) = peers.get(peer_id) {
+                    subscription.store(enabled, Ordering::Release);
+                    Ok(())
+                } else { Err("assinatura de vídeo para peer inexistente".into()) }
+            }
             "ice_candidate" => {
                 let pc = self.peer(peer_id).await?;
                 let init = RTCIceCandidateInit {
@@ -211,11 +283,20 @@ impl MediaEngine {
 
     pub async fn close_peer(&self, peer_id: &str) {
         self.pending_ice.lock().await.remove(peer_id);
+        if let Some(subscription) = self.video_subscribers.lock().await.remove(peer_id) {
+            subscription.store(false, Ordering::Release);
+        }
+        if let Some(worker) = self.video_workers.lock().await.remove(peer_id) { worker.abort(); }
         if let Some(audio) = &self.audio { audio.playback.remove(peer_id); }
         if let Some(pc) = self.peers.lock().await.remove(peer_id) { let _ = pc.close().await; }
     }
     pub async fn close_all(&self) {
         self.pending_ice.lock().await.clear();
+        self.camera.stop().await;
+        for (_, subscription) in self.video_subscribers.lock().await.drain() {
+            subscription.store(false, Ordering::Release);
+        }
+        for (_, worker) in self.video_workers.lock().await.drain() { worker.abort(); }
         if let Some(audio) = &self.audio { audio.playback.clear(); audio.playback.set_deafened(false); audio.set_muted(true); }
         let peers = std::mem::take(&mut *self.peers.lock().await);
         for (_, pc) in peers { let _ = pc.close().await; }
